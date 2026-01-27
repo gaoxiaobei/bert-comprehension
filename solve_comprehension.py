@@ -3,11 +3,12 @@ import torch
 from transformers import AutoTokenizer, AutoModelForMultipleChoice
 import os
 import argparse
+import sys
 
 def main():
-    parser = argparse.ArgumentParser(description="Solve reading comprehension problems using ALBERT with Sliding Window.")
-    parser.add_argument("--article", default="article.md", help="Path to the article file (markdown or text).")
-    parser.add_argument("--qa", default="QA.csv", help="Path to the QA CSV file.")
+    parser = argparse.ArgumentParser(description="Solve reading comprehension with dynamic aggregation strategies.")
+    parser.add_argument("--article", default="article.md", help="Path to the article file.")
+    parser.add_argument("--qa", default="QA.csv", help="Path to the QA CSV file with 'question type' column.")
     parser.add_argument("--model", default="Riiid/kda-albert-xxlarge-v2-race", help="Hugging Face model name.")
     
     args = parser.parse_args()
@@ -34,6 +35,10 @@ def main():
 
     # Read QA
     df = pd.read_csv(qa_path)
+    
+    # Check if 'question type' column exists
+    if 'question type' not in df.columns:
+        print("Warning: 'question type' column not found in CSV. Defaulting to 'main idea' (Average) strategy.")
 
     # Load model and tokenizer
     print(f"Loading model: {model_name}...")
@@ -56,26 +61,28 @@ def main():
 
     for index, row in df.iterrows():
         question = row['question']
-        # Convert all choices to strings to avoid type errors
         options = [str(row['choice A']), str(row['choice B']), str(row['choice C']), str(row['choice D'])]
         correct_label = row['correct answer'].strip()
         
+        # Determine Aggregation Strategy
+        # Default to 'main idea' if column is missing or empty
+        q_type_raw = row.get('question type', 'main idea')
+        q_type = str(q_type_raw).strip().lower()
+        
         print(f"Question {index + 1}: {question}")
+        print(f"  Type:      {q_type_raw}")
         
         # 1. Prepare Inputs
-        # We want the input to be: [CLS] Question + Option [SEP] Article [SEP]
-        # We truncate "only_second" so the Article slides, but Question+Option remains complete.
-        
         prompts = [f"{question} {opt}" for opt in options]
         contexts = [article] * 4
         
         # 2. Tokenize with Sliding Window
         inputs = tokenizer(
-            prompts,       # Text A (Keep intact)
-            contexts,      # Text B (Slide over this)
+            prompts,
+            contexts,
             max_length=512,
             truncation="only_second", 
-            stride=128,    # Amount of overlap between windows
+            stride=128, 
             return_overflowing_tokens=True,
             return_offsets_mapping=False,
             padding="max_length",
@@ -83,37 +90,24 @@ def main():
         )
         
         # 3. Reshape/Regroup Inputs
-        # The tokenizer returns a flat list. We need to organize it into batches where
-        # each batch contains the 4 options for a specific "window" of the text.
-        
         sample_map = inputs.pop("overflow_to_sample_mapping") 
-        # sample_map is a tensor like [0, 0, 1, 1, 2, 2, 3, 3] indicating which option (0-3) a chunk belongs to.
-
-        # Calculate how many chunks exist for each option. 
-        # (They should be equal since the context is identical, but we calculate min for safety).
         chunk_counts = torch.bincount(sample_map, minlength=4)
         num_windows = chunk_counts.min().item()
 
-        # Extract tensor data
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
-        token_type_ids = inputs.get("token_type_ids", None) # ALBERT needs this
+        token_type_ids = inputs.get("token_type_ids", None)
 
-        chunk_logits_list = []
+        window_probs_list = []
 
         with torch.no_grad():
-            # Iterate through each window position (e.g., Window 0, Window 1...)
             for i in range(num_windows):
-                
-                # Build the batch for this specific window
+                # Build batch for the i-th window
                 window_input_ids = []
                 window_att_mask = []
                 window_token_types = []
 
                 for option_idx in range(4):
-                    # Find the index of the i-th chunk for the current option_idx
-                    # (sample_map == option_idx) gives indices for that option
-                    # .nonzero() returns the actual positions in the flat list
                     indices = (sample_map == option_idx).nonzero(as_tuple=True)[0]
                     chunk_idx = indices[i]
 
@@ -122,36 +116,48 @@ def main():
                     if token_type_ids is not None:
                         window_token_types.append(token_type_ids[chunk_idx])
 
-                # Stack to create batch of shape [1, 4, seq_len]
                 b_input_ids = torch.stack(window_input_ids).unsqueeze(0).to(device)
                 b_att_mask = torch.stack(window_att_mask).unsqueeze(0).to(device)
                 b_token_type = torch.stack(window_token_types).unsqueeze(0).to(device) if token_type_ids is not None else None
                 
-                # Model Inference
                 outputs = model(
                     input_ids=b_input_ids, 
                     attention_mask=b_att_mask, 
                     token_type_ids=b_token_type
                 )
                 
-                # Store logits for this window: Shape [4]
-                chunk_logits_list.append(outputs.logits.squeeze(0))
+                # Calculate Probabilities for this specific window
+                logits = outputs.logits.squeeze(0) # [4]
+                probs = torch.softmax(logits, dim=0)
+                window_probs_list.append(probs)
 
-        # 4. Aggregate Results
-        # Stack all window logits: [num_windows, 4]
-        all_logits = torch.stack(chunk_logits_list)
+        # 4. Dynamic Aggregation
+        # Stack: [num_windows, 4]
+        all_probs_tensor = torch.stack(window_probs_list)
         
-        # Method: Mean Pooling of Logits (Averaging scores across all text windows)
-        avg_logits = torch.mean(all_logits, dim=0)
-        
-        # Calculate final probabilities
-        final_probs = torch.softmax(avg_logits, dim=0).cpu().tolist()
-        predicted_class_id = torch.argmax(avg_logits).item()
+        final_scores = None
+        strategy_desc = ""
+
+        if q_type == 'detail':
+            # Strategy: Max Pooling
+            # Use the single highest probability found in any window for each option independently.
+            final_scores, _ = torch.max(all_probs_tensor, dim=0)
+            strategy_desc = "Max Pooling (Highest score across windows)"
+        else:
+            # Strategy: Mean Pooling (Default / Main Idea)
+            # Average the probabilities across all windows.
+            final_scores = torch.mean(all_probs_tensor, dim=0)
+            strategy_desc = "Mean Pooling (Average score across windows)"
+
+        # Get final prediction
+        final_scores_list = final_scores.cpu().tolist()
+        predicted_class_id = torch.argmax(final_scores).item()
         predicted_label = reverse_option_map[predicted_class_id]
         
-        print(f"  Probabilities (Averaged across {num_windows} windows):")
-        for i, prob in enumerate(final_probs):
-            print(f"    {reverse_option_map[i]}: {prob:.4f}")
+        print(f"  Strategy:  {strategy_desc}")
+        print(f"  Scores:")
+        for i, score in enumerate(final_scores_list):
+            print(f"    {reverse_option_map[i]}: {score:.4f}")
         
         print(f"  Predicted: {predicted_label}")
         print(f"  Correct:   {correct_label}")
