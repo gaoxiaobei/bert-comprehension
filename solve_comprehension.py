@@ -5,12 +5,16 @@ import os
 import argparse
 
 def main():
-    parser = argparse.ArgumentParser(description="Solve reading comprehension problems using ALBERT.")
+    parser = argparse.ArgumentParser(description="Solve reading comprehension problems using ALBERT with Sliding Window.")
     parser.add_argument("--article", default="article.md", help="Path to the article file (markdown or text).")
     parser.add_argument("--qa", default="QA.csv", help="Path to the QA CSV file.")
     parser.add_argument("--model", default="Riiid/kda-albert-xxlarge-v2-race", help="Hugging Face model name.")
     
     args = parser.parse_args()
+
+    # Device configuration
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     # File paths
     article_path = args.article
@@ -32,17 +36,17 @@ def main():
     df = pd.read_csv(qa_path)
 
     # Load model and tokenizer
-    model_name = "Riiid/kda-albert-xxlarge-v2-race"
     print(f"Loading model: {model_name}...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForMultipleChoice.from_pretrained(model_name)
+        model.to(device)
+        model.eval()
     except Exception as e:
         print(f"Error loading model: {e}")
         return
 
     # Map for options
-    option_map = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
     reverse_option_map = {0: 'A', 1: 'B', 2: 'C', 3: 'D'}
 
     print("\nStarting comprehension task...\n")
@@ -52,123 +56,100 @@ def main():
 
     for index, row in df.iterrows():
         question = row['question']
-        options = [row['choice A'], row['choice B'], row['choice C'], row['choice D']]
+        # Convert all choices to strings to avoid type errors
+        options = [str(row['choice A']), str(row['choice B']), str(row['choice C']), str(row['choice D'])]
         correct_label = row['correct answer'].strip()
         
         print(f"Question {index + 1}: {question}")
         
-        # Prepare inputs
-        # Context is the article.
-        # Candidates are Question + Option
+        # 1. Prepare Inputs
+        # We want the input to be: [CLS] Question + Option [SEP] Article [SEP]
+        # We truncate "only_second" so the Article slides, but Question+Option remains complete.
         
-        # We need to repeat the context for each option
+        prompts = [f"{question} {opt}" for opt in options]
         contexts = [article] * 4
-        candidates = [f"{question} {option}" for option in options]
         
-        # Tokenize with sliding window
-        # We process each choice + article pair. 
-        # Since the article is long, we might get multiple chunks for each choice.
-        # To keep it simple and effective: 
-        # 1. Tokenize the article only first to get chunks? No, we need [CLS] Question [SEP] Article [SEP].
-        #    Actually, standard BERT/ALBERT for RACE is [CLS] Question + Option [SEP] Article [SEP] or similar.
-        #    Let's stick to the previous format: context=article, candidate=question+option.
-        #    But we apply sliding window on the context.
-        
-        # We'll use a manual loop to handle the complexity of aligning chunks across 4 options.
-        # We want to ensure that for a given "pass", all 4 options see the SAME chunk of text.
-        
-        tokens = tokenizer(
-            [question] * 4, # Text A: Question (short, won't be truncated)
-            [article] * 4,  # Text B: Article (long, will be truncated/strided)
+        # 2. Tokenize with Sliding Window
+        inputs = tokenizer(
+            prompts,       # Text A (Keep intact)
+            contexts,      # Text B (Slide over this)
             max_length=512,
-            truncation="only_second", # Only truncate the article
-            stride=128,
+            truncation="only_second", 
+            stride=128,    # Amount of overlap between windows
             return_overflowing_tokens=True,
             return_offsets_mapping=False,
-            padding="max_length", # Pad to max length to ensure consistent shapes if needed, or just True
+            padding="max_length",
             return_tensors="pt"
         )
         
-        # 'tokens' will contain a flat list of all chunks for all 4 options.
-        # We need to restructure them.
-        # The tokenizer returns an 'overflow_to_sample_mapping' which tells us which original sample (0,1,2,3) a chunk belongs to.
+        # 3. Reshape/Regroup Inputs
+        # The tokenizer returns a flat list. We need to organize it into batches where
+        # each batch contains the 4 options for a specific "window" of the text.
         
-        sample_map = tokens.pop("overflow_to_sample_mapping")
-        
-        # We need to group chunks by their "chunk index" (i.e., 1st chunk of opt A, 1st chunk of opt B, etc.)
-        # However, the number of chunks might vary if options vary significantly in length (unlikely here) or if the stride hits boundaries differently.
-        # For safety, let's assume we can group by the sequence of chunks generated.
-        # Since we passed 4 pairs, and they share the exact same long context (article), they should produce the same number of chunks.
-        
-        # Let's verify number of chunks per option
-        num_chunks = len(tokens['input_ids']) // 4
-        
-        # We will accumulate probabilities (or logits) across chunks.
-        # Strategy: Max-Pooling or Averaging. 
-        # If the evidence is in Chunk X, Chunk X should give a high prob for the correct answer. 
-        # Other chunks might be ambiguous.
-        # Let's try Averaging probabilities.
-        
-        final_probs = torch.zeros(4)
-        
-        # Reshape input_ids to [num_chunks, 4, seq_len]
-        # The tokenizer outputs: [OptA_Chunk1, OptA_Chunk2, OptB_Chunk1, OptB_Chunk2, ...] (Sequential by sample)
-        # Wait, HuggingFace tokenizer usually outputs [Sample0_Chunk0, Sample0_Chunk1, Sample1_Chunk0, ...]
-        
-        # Let's reorganize.
-        # We have a dict of tensors.
-        
-        # Group inputs by chunk index
-        # Expectation: inputs['input_ids'] has shape [total_chunks, seq_len]
-        # We want to form batches of size 4 (one for each option) corresponding to the same text span.
-        
-        # Since all options are roughly same length and context is identical:
-        # We assume each option generated 'num_chunks' chunks.
-        
-        # Create a list of batches, where each batch is a dictionary of tensors for the 4 options.
-        
-        chunk_batches = []
-        for i in range(num_chunks):
-            # We want the i-th chunk for Option 0, i-th for Option 1, etc.
-            # Index in the flat list: 
-            # Option 0's i-th chunk is at index: i
-            # Option 1's i-th chunk is at index: i + num_chunks
-            # ... NO. 
-            # overflow_to_sample_mapping maps index -> sample_id.
-            # Example: [0, 0, 1, 1, 2, 2, 3, 3] if each has 2 chunks.
-            
-            indices = [i + j * num_chunks for j in range(4)]
-            
-            batch_inputs = {
-                k: v[indices] for k, v in tokens.items() 
-                if isinstance(v, torch.Tensor)
-            }
-            chunk_batches.append(batch_inputs)
+        sample_map = inputs.pop("overflow_to_sample_mapping") 
+        # sample_map is a tensor like [0, 0, 1, 1, 2, 2, 3, 3] indicating which option (0-3) a chunk belongs to.
 
-        model.eval()
-        
-        chunk_probs_list = []
+        # Calculate how many chunks exist for each option. 
+        # (They should be equal since the context is identical, but we calculate min for safety).
+        chunk_counts = torch.bincount(sample_map, minlength=4)
+        num_windows = chunk_counts.min().item()
+
+        # Extract tensor data
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        token_type_ids = inputs.get("token_type_ids", None) # ALBERT needs this
+
+        chunk_logits_list = []
 
         with torch.no_grad():
-            for batch in chunk_batches:
-                # Shape: [4, seq_len] -> Need [1, 4, seq_len] for the model
-                b_input_ids = batch['input_ids'].unsqueeze(0)
-                b_att_mask = batch['attention_mask'].unsqueeze(0)
-                b_token_type = batch['token_type_ids'].unsqueeze(0) if 'token_type_ids' in batch else None
+            # Iterate through each window position (e.g., Window 0, Window 1...)
+            for i in range(num_windows):
                 
-                outputs = model(input_ids=b_input_ids, attention_mask=b_att_mask, token_type_ids=b_token_type)
-                logits = outputs.logits # [1, 4]
-                probs = torch.softmax(logits, dim=1).squeeze(0) # [4]
-                chunk_probs_list.append(probs)
+                # Build the batch for this specific window
+                window_input_ids = []
+                window_att_mask = []
+                window_token_types = []
 
-        # Aggregate: Average Probabilities
-        avg_probs = torch.stack(chunk_probs_list).mean(dim=0)
-        final_probs = avg_probs.tolist()
+                for option_idx in range(4):
+                    # Find the index of the i-th chunk for the current option_idx
+                    # (sample_map == option_idx) gives indices for that option
+                    # .nonzero() returns the actual positions in the flat list
+                    indices = (sample_map == option_idx).nonzero(as_tuple=True)[0]
+                    chunk_idx = indices[i]
 
-        predicted_class_id = avg_probs.argmax().item()
+                    window_input_ids.append(input_ids[chunk_idx])
+                    window_att_mask.append(attention_mask[chunk_idx])
+                    if token_type_ids is not None:
+                        window_token_types.append(token_type_ids[chunk_idx])
+
+                # Stack to create batch of shape [1, 4, seq_len]
+                b_input_ids = torch.stack(window_input_ids).unsqueeze(0).to(device)
+                b_att_mask = torch.stack(window_att_mask).unsqueeze(0).to(device)
+                b_token_type = torch.stack(window_token_types).unsqueeze(0).to(device) if token_type_ids is not None else None
+                
+                # Model Inference
+                outputs = model(
+                    input_ids=b_input_ids, 
+                    attention_mask=b_att_mask, 
+                    token_type_ids=b_token_type
+                )
+                
+                # Store logits for this window: Shape [4]
+                chunk_logits_list.append(outputs.logits.squeeze(0))
+
+        # 4. Aggregate Results
+        # Stack all window logits: [num_windows, 4]
+        all_logits = torch.stack(chunk_logits_list)
+        
+        # Method: Mean Pooling of Logits (Averaging scores across all text windows)
+        avg_logits = torch.mean(all_logits, dim=0)
+        
+        # Calculate final probabilities
+        final_probs = torch.softmax(avg_logits, dim=0).cpu().tolist()
+        predicted_class_id = torch.argmax(avg_logits).item()
         predicted_label = reverse_option_map[predicted_class_id]
         
-        print(f"  Probabilities (Averaged across {num_chunks} chunks):")
+        print(f"  Probabilities (Averaged across {num_windows} windows):")
         for i, prob in enumerate(final_probs):
             print(f"    {reverse_option_map[i]}: {prob:.4f}")
         
