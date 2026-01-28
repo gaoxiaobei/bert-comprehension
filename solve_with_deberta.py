@@ -9,6 +9,7 @@ def main():
     parser.add_argument("--article", default="article.md", help="Path to the article file.")
     parser.add_argument("--qa", default="QA.csv", help="Path to the QA CSV file.")
     parser.add_argument("--model", default="artianand/deberta-v3-large-race", help="Hugging Face model name.")
+    parser.add_argument("--max_len", type=int, default=1024, help="Manual maximum context window limit.")
     
     args = parser.parse_args()
 
@@ -16,6 +17,7 @@ def main():
     article_path = args.article
     qa_path = args.qa
     model_name = args.model
+    user_max_limit = args.max_len  # 用户自定义的上限，忽略模型config中的512
 
     if not os.path.exists(article_path):
         print(f"Error: Article file '{article_path}' not found.")
@@ -34,8 +36,7 @@ def main():
     # Load model and tokenizer
     print(f"Loading model: {model_name}...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
+    
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForMultipleChoice.from_pretrained(model_name)
@@ -44,11 +45,10 @@ def main():
         print(f"Error loading model: {e}")
         return
 
-    # Map for options
     reverse_option_map = {0: 'A', 1: 'B', 2: 'C', 3: 'D'}
-    max_seq_length = 1024
 
-    print(f"\nStarting comprehension task (Context Window: {max_seq_length})...\n")
+    print(f"Configuration: Using dynamic window with a hard cap of {user_max_limit} tokens.")
+    print("\nStarting comprehension task...\n")
 
     correct_count = 0
     total_questions = len(df)
@@ -59,53 +59,52 @@ def main():
         correct_label = row['correct answer'].strip()
         
         print(f"=== Question {index + 1} ===")
-        print(f"Q: {question}")
         
-        # 构造输入对
-        first_sentences = [article] * 4
-        second_sentences = [f"{question} {option}" for option in options]
+        # 1. 预计算当前题目需要的 Token 长度
+        # 不设限，测量实际长度
+        temp_inputs = tokenizer(
+            [article] * 4,
+            [f"{question} {opt}" for opt in options],
+            truncation=False
+        )
         
-        # Tokenize
+        actual_max_needed = max([len(x) for x in temp_inputs['input_ids']])
+        
+        # 2. 自动适配 Context Window
+        # 取 (实际需要) 和 (用户指定的 1024) 的最小值
+        dynamic_window = min(actual_max_needed, user_max_limit)
+        
+        print(f"  [Token Stats] Actual needed: {actual_max_needed} tokens.")
+        print(f"  [Window Size] Adapted to: {dynamic_window} tokens.")
+
+        # 3. 正式 Tokenize
         inputs = tokenizer(
-            first_sentences,
-            second_sentences,
-            max_length=max_seq_length,
-            truncation="only_first", # 保证只截断文章，保留问题和选项
+            [article] * 4,
+            [f"{question} {opt}" for opt in options],
+            max_length=dynamic_window,
+            truncation="only_first", # 重点：若超长，只砍掉文章，保留问题和选项
             padding="max_length",
             return_tensors="pt"
         )
 
-        # --- Debug: Token Stats & Preview ---
-        # 计算实际 Token 长度 (通过 attention_mask 求和)
-        real_token_counts = inputs['attention_mask'].sum(dim=1).tolist()
-        
-        print(f"  [Token Stats]")
-        for i, count in enumerate(real_token_counts):
-            status = "TRUNCATED" if count == max_seq_length else "OK"
-            print(f"    Option {reverse_option_map[i]}: {count} tokens ({status})")
-        
-        # 预览第一个选项的输入内容 (解码)
-        # 这里的目的是检查：文章开头是否还在？最重要的问题和选项是否在末尾？
-        print(f"  [Input Preview - Option A]")
+        # --- Input Preview ---
+        # 预览第一个选项的解码效果，确保 [SEP] 后面能看到问题
         input_ids_opt_a = inputs['input_ids'][0]
-        # 解码所有非 padding 的部分
-        decoded_text = tokenizer.decode(input_ids_opt_a[inputs['attention_mask'][0] == 1])
+        decoded_text = tokenizer.decode(input_ids_opt_a)
         
-        # 为了不刷屏，只显示 开头 150字符 ... 结尾 150字符
-        preview_len = 150
+        # 截取前后预览
+        preview_len = 120
         if len(decoded_text) > preview_len * 2:
-            preview_str = f"{decoded_text[:preview_len]} ... [CONTENT HIDDEN] ... {decoded_text[-preview_len:]}"
+            preview_str = f"{decoded_text[:preview_len]} ... [HIDDEN] ... {decoded_text[-preview_len:]}"
         else:
             preview_str = decoded_text
-            
-        print(f"    Raw Input: \"{preview_str}\"\n")
-        # ------------------------------------
+        print(f"  [Input Preview] {preview_str}")
 
-        # 调整维度 [Batch, Choices, Seq]
+        # 4. 推理
         model_inputs = {k: v.unsqueeze(0).to(device) for k, v in inputs.items()}
-
         model.eval()
         with torch.no_grad():
+            # 注意：DeBERTa 处理超过 512 的序列时，显存占用会激增
             outputs = model(**model_inputs)
             logits = outputs.logits
             probs = torch.softmax(logits, dim=1).squeeze(0)
@@ -118,15 +117,14 @@ def main():
         for i, prob in enumerate(final_probs):
             print(f"    {reverse_option_map[i]}: {prob:.4f}")
         
-        print(f"  Predicted: {predicted_label}")
-        print(f"  Correct:   {correct_label}")
+        print(f"  Predicted: {predicted_label} | Correct: {correct_label}")
         
         if predicted_label == correct_label:
             print("  Result:    CORRECT")
             correct_count += 1
         else:
             print("  Result:    INCORRECT")
-        print("-" * 50)
+        print("-" * 60)
 
     print(f"\nFinished. Accuracy: {correct_count}/{total_questions} ({correct_count/total_questions*100:.2f}%)")
 
