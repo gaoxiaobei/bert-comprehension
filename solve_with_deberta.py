@@ -46,8 +46,9 @@ def main():
 
     # Map for options
     reverse_option_map = {0: 'A', 1: 'B', 2: 'C', 3: 'D'}
+    max_seq_length = 1024
 
-    print("\nStarting comprehension task (Context Window: 1024)...\n")
+    print(f"\nStarting comprehension task (Context Window: {max_seq_length})...\n")
 
     correct_count = 0
     total_questions = len(df)
@@ -57,28 +58,50 @@ def main():
         options = [row['choice A'], row['choice B'], row['choice C'], row['choice D']]
         correct_label = row['correct answer'].strip()
         
-        print(f"Question {index + 1}: {question}")
+        print(f"=== Question {index + 1} ===")
+        print(f"Q: {question}")
         
         # 构造输入对
-        # 通常做法是: Sentence 1 = 文章, Sentence 2 = 问题 + 选项
-        # 这样模型可以基于文章来判断 问题+选项 的合理性
         first_sentences = [article] * 4
         second_sentences = [f"{question} {option}" for option in options]
         
         # Tokenize
-        # max_length=1024
-        # truncation="only_first": 只需要截断文章(article)，保留问题和选项完整
         inputs = tokenizer(
             first_sentences,
             second_sentences,
-            max_length=1024,
-            truncation="only_first", 
+            max_length=max_seq_length,
+            truncation="only_first", # 保证只截断文章，保留问题和选项
             padding="max_length",
             return_tensors="pt"
         )
 
-        # 调整维度以适应模型 [Batch_Size, Num_Choices, Seq_Len]
-        # 当前 inputs 的维度是 [4, 1024]，我们需要变成 [1, 4, 1024]
+        # --- Debug: Token Stats & Preview ---
+        # 计算实际 Token 长度 (通过 attention_mask 求和)
+        real_token_counts = inputs['attention_mask'].sum(dim=1).tolist()
+        
+        print(f"  [Token Stats]")
+        for i, count in enumerate(real_token_counts):
+            status = "TRUNCATED" if count == max_seq_length else "OK"
+            print(f"    Option {reverse_option_map[i]}: {count} tokens ({status})")
+        
+        # 预览第一个选项的输入内容 (解码)
+        # 这里的目的是检查：文章开头是否还在？最重要的问题和选项是否在末尾？
+        print(f"  [Input Preview - Option A]")
+        input_ids_opt_a = inputs['input_ids'][0]
+        # 解码所有非 padding 的部分
+        decoded_text = tokenizer.decode(input_ids_opt_a[inputs['attention_mask'][0] == 1])
+        
+        # 为了不刷屏，只显示 开头 150字符 ... 结尾 150字符
+        preview_len = 150
+        if len(decoded_text) > preview_len * 2:
+            preview_str = f"{decoded_text[:preview_len]} ... [CONTENT HIDDEN] ... {decoded_text[-preview_len:]}"
+        else:
+            preview_str = decoded_text
+            
+        print(f"    Raw Input: \"{preview_str}\"\n")
+        # ------------------------------------
+
+        # 调整维度 [Batch, Choices, Seq]
         model_inputs = {k: v.unsqueeze(0).to(device) for k, v in inputs.items()}
 
         model.eval()
@@ -91,7 +114,7 @@ def main():
         predicted_class_id = probs.argmax().item()
         predicted_label = reverse_option_map[predicted_class_id]
         
-        print(f"  Probabilities:")
+        print(f"  [Results]")
         for i, prob in enumerate(final_probs):
             print(f"    {reverse_option_map[i]}: {prob:.4f}")
         
@@ -103,7 +126,7 @@ def main():
             correct_count += 1
         else:
             print("  Result:    INCORRECT")
-        print("-" * 30)
+        print("-" * 50)
 
     print(f"\nFinished. Accuracy: {correct_count}/{total_questions} ({correct_count/total_questions*100:.2f}%)")
 
