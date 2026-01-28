@@ -5,19 +5,20 @@ import os
 import argparse
 
 def main():
-    parser = argparse.ArgumentParser(description="Solve reading comprehension problems using DeBERTa.")
+    parser = argparse.ArgumentParser(description="Solve reading comprehension using DeBERTa.")
     parser.add_argument("--article", default="article.md", help="Path to the article file.")
     parser.add_argument("--qa", default="QA.csv", help="Path to the QA CSV file.")
     parser.add_argument("--model", default="artianand/deberta-v3-large-race", help="Hugging Face model name.")
-    parser.add_argument("--max_len", type=int, default=1024, help="Manual maximum context window limit.")
+    parser.add_argument("--max_len", type=int, default=1024, help="Maximum allowed context window.")
+    parser.add_argument("--fixed", action="store_true", help="If set, force the window to always be max_len. Otherwise, use dynamic window.")
     
     args = parser.parse_args()
 
-    # File paths
+    # 配置
     article_path = args.article
     qa_path = args.qa
     model_name = args.model
-    user_max_limit = args.max_len  # 用户自定义的上限，忽略模型config中的512
+    user_max_limit = args.max_len 
 
     if not os.path.exists(article_path):
         print(f"Error: Article file '{article_path}' not found.")
@@ -26,14 +27,12 @@ def main():
         print(f"Error: QA file '{qa_path}' not found.")
         return
 
-    # Read article
+    # 读取内容
     with open(article_path, "r", encoding="utf-8") as f:
         article = f.read().strip()
-
-    # Read QA
     df = pd.read_csv(qa_path)
 
-    # Load model and tokenizer
+    # 加载模型
     print(f"Loading model: {model_name}...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -47,8 +46,9 @@ def main():
 
     reverse_option_map = {0: 'A', 1: 'B', 2: 'C', 3: 'D'}
 
-    print(f"Configuration: Using dynamic window with a hard cap of {user_max_limit} tokens.")
-    print("\nStarting comprehension task...\n")
+    print(f"Mode: {'FIXED' if args.fixed else 'DYNAMIC'} Window")
+    print(f"Max Limit: {user_max_limit} tokens")
+    print(f"Device: {device}\n")
 
     correct_count = 0
     total_questions = len(df)
@@ -60,51 +60,49 @@ def main():
         
         print(f"=== Question {index + 1} ===")
         
-        # 1. 预计算当前题目需要的 Token 长度
-        # 不设限，测量实际长度
+        # 1. 预计算实际需要的 Token 长度
         temp_inputs = tokenizer(
             [article] * 4,
             [f"{question} {opt}" for opt in options],
             truncation=False
         )
+        actual_needed = max([len(x) for x in temp_inputs['input_ids']])
         
-        actual_max_needed = max([len(x) for x in temp_inputs['input_ids']])
+        # 2. 确定最终使用的窗口大小
+        if args.fixed:
+            final_window = user_max_limit
+        else:
+            final_window = min(actual_needed, user_max_limit)
         
-        # 2. 自动适配 Context Window
-        # 取 (实际需要) 和 (用户指定的 1024) 的最小值
-        dynamic_window = min(actual_max_needed, user_max_limit)
-        
-        print(f"  [Token Stats] Actual needed: {actual_max_needed} tokens.")
-        print(f"  [Window Size] Adapted to: {dynamic_window} tokens.")
+        print(f"  [Window Config] Actual needed: {actual_needed} | Selected: {final_window}")
 
-        # 3. 正式 Tokenize
+        # 3. 正式编码
+        # truncation="only_first" 确保文章太长时从头部截断，保留尾部的问题和选项
         inputs = tokenizer(
             [article] * 4,
             [f"{question} {opt}" for opt in options],
-            max_length=dynamic_window,
-            truncation="only_first", # 重点：若超长，只砍掉文章，保留问题和选项
+            max_length=final_window,
+            truncation="only_first", 
             padding="max_length",
             return_tensors="pt"
         )
 
-        # --- Input Preview ---
-        # 预览第一个选项的解码效果，确保 [SEP] 后面能看到问题
-        input_ids_opt_a = inputs['input_ids'][0]
-        decoded_text = tokenizer.decode(input_ids_opt_a)
+        # 4. 输入预览 (查看末尾是否包含问题和选项)
+        # 预览第一个选项 (A)
+        valid_ids = inputs['input_ids'][0][inputs['attention_mask'][0] == 1]
+        full_decoded_valid = tokenizer.decode(valid_ids, skip_special_tokens=False)
+        # 统计实际有效的非 padding token
+        valid_tokens = inputs['attention_mask'][0].sum().item()
         
-        # 截取前后预览
-        preview_len = 120
-        if len(decoded_text) > preview_len * 2:
-            preview_str = f"{decoded_text[:preview_len]} ... [HIDDEN] ... {decoded_text[-preview_len:]}"
-        else:
-            preview_str = decoded_text
-        print(f"  [Input Preview] {preview_str}")
+        print(f"  [Token Stats] Valid non-padding tokens: {valid_tokens}")
+        # 截取最后120个字符作为预览
+        preview_tail = full_decoded_valid[-150:].replace('\n', ' ')
+        print(f"  [Tail Preview] ... {preview_tail}")
 
-        # 4. 推理
+        # 5. 模型推理
         model_inputs = {k: v.unsqueeze(0).to(device) for k, v in inputs.items()}
         model.eval()
         with torch.no_grad():
-            # 注意：DeBERTa 处理超过 512 的序列时，显存占用会激增
             outputs = model(**model_inputs)
             logits = outputs.logits
             probs = torch.softmax(logits, dim=1).squeeze(0)
@@ -113,20 +111,23 @@ def main():
         predicted_class_id = probs.argmax().item()
         predicted_label = reverse_option_map[predicted_class_id]
         
-        print(f"  [Results]")
+        # 6. 结果展示
+        print(f"  [Probabilities]")
         for i, prob in enumerate(final_probs):
-            print(f"    {reverse_option_map[i]}: {prob:.4f}")
+            tag = " <- PREDICTED" if i == predicted_class_id else ""
+            print(f"    {reverse_option_map[i]}: {prob:.4f}{tag}")
         
-        print(f"  Predicted: {predicted_label} | Correct: {correct_label}")
+        print(f"  Result: {predicted_label} (Correct: {correct_label})", end=" ")
         
         if predicted_label == correct_label:
-            print("  Result:    CORRECT")
+            print("[CORRECT ✅]")
             correct_count += 1
         else:
-            print("  Result:    INCORRECT")
-        print("-" * 60)
+            print("[INCORRECT ❌]")
+        print("-" * 65)
 
-    print(f"\nFinished. Accuracy: {correct_count}/{total_questions} ({correct_count/total_questions*100:.2f}%)")
+    accuracy = (correct_count / total_questions) * 100
+    print(f"\nFinal Accuracy: {correct_count}/{total_questions} ({accuracy:.2f}%)")
 
 if __name__ == "__main__":
     main()
